@@ -1,12 +1,10 @@
 # NetForgeCN v2ray-rules-dat
 
-Self-maintained `geosite.dat` / `geoip.dat`, built from upstream Loyalsoldier full set **plus** the ad/privacy lists that upstream does not include.
+Self-maintained `geosite.dat` / `geoip.dat` for V2Ray-family routers. Built from the Loyalsoldier full rule set plus additional ad/privacy domain lists, published as GitHub release assets with `sha256sum` files.
 
-## What is different from upstream
+## Rule Sets
 
-Base = `Loyalsoldier/v2ray-rules-dat` (all tags: `cn`, `china-list`, `geolocation-!cn`, `category-ads-all`, `apple-cn`, `google-cn`, `gfw`, `greatfire`, `win-*` ...).
-
-Extra domains are injected into `category-ads-all` and exposed as independent tags:
+The baseline is `Loyalsoldier/v2ray-rules-dat` (tags: `cn`, `china-list`, `geolocation-!cn`, `category-ads-all`, `apple-cn`, `google-cn`, `gfw`, `greatfire`, `win-*` and the rest). Four extra tags are compiled in:
 
 | tag | source | format in source |
 |---|---|---|
@@ -15,9 +13,7 @@ Extra domains are injected into `category-ads-all` and exposed as independent ta
 | `netforge-neodev` | neodevpro/neodevhost `domain` | plain domain |
 | `netforge-ads` | union of the three above | plain domain |
 
-`accelerated-domains.china.conf` is NOT duplicated: upstream already compiles it into `china-list` and `cn`.
-
-All four extra tags are merged into `category-ads-all`, so a single `geosite:category-ads-all` rule already covers them.
+All four extra tags are merged into `category-ads-all`, so a single `geosite:category-ads-all` rule covers them. China acceleration domains are provided by the upstream `china-list` and `cn` tags.
 
 ## Download (stable paths)
 
@@ -27,13 +23,13 @@ All four extra tags are merged into `category-ads-all`, so a single `geosite:cat
 - geoip.dat (CDN): `https://cdn.jsdelivr.net/gh/NetForgeCN/v2ray-rules-dat@release/geoip.dat`
 - extra tag plaintext: `https://raw.githubusercontent.com/NetForgeCN/v2ray-rules-dat/release/netforge-ads.txt`
 
-Third-party makefile (e.g. in your firmware) only needs the owner changed from `Loyalsoldier` to `NetForgeCN`; the repo name and file names are identical.
+Each asset has a matching `.sha256sum`. A downstream OpenWrt package can consume these URLs directly; [NetForgeCN/Loyalsoldier](https://github.com/NetForgeCN/Loyalsoldier) is the packaging layer that turns them into `v2ray-geoip` / `v2ray-geosite` packages.
 
-## Update policy
+## Update Policy
 
-Upstream builds daily at 22:00 UTC (06:00 Beijing). This repo checks every 30 minutes and only builds when the latest upstream release is at least **2 hours old** and has not been built yet. Each release body records `upstream: <tag>` for idempotency.
+The upstream project builds daily at 22:00 UTC (06:00 Beijing). This repository checks every 30 minutes and builds when the latest upstream release is at least **2 hours old** and has not been built yet. Each release body records `upstream: <tag>` for idempotency.
 
-Manual rebuild: Actions → Build NetForgeCN rules dat files → Run workflow.
+Manual rebuild: Actions → **Build NetForgeCN rules dat files** → Run workflow.
 
 ## Customization
 
@@ -41,6 +37,8 @@ Manual rebuild: Actions → Build NetForgeCN rules dat files → Run workflow.
 - `override/direct.txt`, `override/proxy.txt`, `override/reject.txt` — domains to add.
 - `override/*-need-to-remove.txt` — domains to remove.
 
-## Credits / licensing
+## License
 
-Upstream data from Loyalsoldier/v2ray-rules-dat, v2fly/domain-list-community, felixonmars/dnsmasq-china-list, anti-AD, Cats-Team/AdRules, neodevpro/neodevhost. Respect each upstream license and attribution when redistributing the generated files.
+GPL-3.0, see [LICENSE](LICENSE).
+
+Upstream data comes from Loyalsoldier/v2ray-rules-dat, v2fly/domain-list-community, felixonmars/dnsmasq-china-list, anti-AD, Cats-Team/AdRules and neodevpro/neodevhost. Respect each upstream license and attribution when redistributing the generated files.
