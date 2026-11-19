@@ -2,6 +2,15 @@ name: Build NetForgeCN rules dat files
 
 on:
   workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force rebuild even if upstream tag unchanged'
+        type: boolean
+        default: false
+      build_exceptions:
+        description: 'Rebuild srs exception tags from remote rule-sets'
+        type: boolean
+        default: false
   schedule:
     # Every 30 min; the guard step decides whether upstream is >=2h old.
     - cron: '*/30 * * * *'
@@ -51,17 +60,29 @@ jobs:
           echo "ADRULES_URL=$ADRULES_URL" >> $GITHUB_ENV
           echo "NEODEV_URL=$NEODEV_URL" >> $GITHUB_ENV
 
-          # Query upstream latest release time (UTC ISO8601) via GitHub API
-          UPSTREAM_TAG=$(curl -fsSL --retry 3 -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("tag_name",""))')
-          UPSTREAM_PUBLISHED=$(curl -fsSL --retry 3 -H "Accept: application/vnd.github+json" \
-            https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("published_at",""))')
+          # Query upstream latest release time via GitHub API.
+          # NOTE: authenticated request is REQUIRED. Anonymous API calls from shared
+          # runner IPs hit the 60 req/h limit and return 403 (root cause of run #44486261146).
+          API_HDRS=(-fsSL --retry 5 --retry-all-errors --retry-delay 3
+                    -H "Accept: application/vnd.github+json"
+                    -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
+                    -H "X-GitHub-Api-Version: 2022-11-28")
+          UPSTREAM_JSON=$(curl "${API_HDRS[@]}" \
+            https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest) || UPSTREAM_JSON=""
+          if [ -z "$UPSTREAM_JSON" ]; then
+            # Fallback: use git ls-remote (no API rate limit) to at least get the tag.
+            echo "GitHub API failed; falling back to git ls-remote"
+            UPSTREAM_TAG=$(git ls-remote --tags --refs https://github.com/Loyalsoldier/v2ray-rules-dat.git \
+              | awk -F/ '{print $NF}' | grep -E '^[0-9]{12}$' | sort | tail -1)
+            UPSTREAM_PUBLISHED=""
+          else
+            UPSTREAM_TAG=$(printf '%s' "$UPSTREAM_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tag_name",""))')
+            UPSTREAM_PUBLISHED=$(printf '%s' "$UPSTREAM_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("published_at",""))')
+          fi
           echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
           echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
 
-          if [ -z "$UPSTREAM_TAG" ] || [ -z "$UPSTREAM_PUBLISHED" ]; then
+          if [ -z "$UPSTREAM_TAG" ]; then
             echo "upstream_tag is empty, abort"
             echo "built=false" >> $GITHUB_OUTPUT
             exit 1
@@ -70,6 +91,12 @@ jobs:
           # Manual dispatch skips the 2h wait (user explicitly asked to run now).
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Manual dispatch: skip 2h guard"
+            echo "built=true" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+          # If API failed (no published_at), skip age/idempotency guard and build.
+          if [ -z "$UPSTREAM_PUBLISHED" ]; then
+            echo "No published_at (API fallback); skip age guard"
             echo "built=true" >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -82,7 +109,7 @@ jobs:
 
           # Idempotency: find the upstream_tag recorded in this repo's latest release body.
           LAST_TAG=""
-          LAST_BODY=$(curl -fsSL --retry 2 -H "Accept: application/vnd.github+json" \
+          LAST_BODY=$(curl "${API_HDRS[@]}" \
             https://api.github.com/repos/${{ github.repository }}/releases/latest \
             | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("body",""))' 2>/dev/null || true)
           if [ -n "$LAST_BODY" ]; then
@@ -247,8 +274,12 @@ jobs:
           cat temp-netforge-adrules.txt | sort --ignore-case -u > ./community/data/netforge-adrules
           cat temp-netforge-neodev.txt | sort --ignore-case -u > ./community/data/netforge-neodev
           cat temp-netforge-ads.txt | sort --ignore-case -u > ./community/data/netforge-ads
+          # srs-derived exception tags (from nekolsd/sing-geosite rule-set).
+          # These are independent tags; they do NOT alter cn / geolocation-!cn.
+          cp ./selfrepo/override/nf-direct-exception ./community/data/nf-direct-exception
+          cp ./selfrepo/override/nf-proxy-exception ./community/data/nf-proxy-exception
           echo "custom tags written:"
-          wc -l ./community/data/netforge-*
+          wc -l ./community/data/netforge-* ./community/data/nf-*
 
       - name: Add special rules back
         if: steps.vars.outputs.built == 'true'
@@ -297,6 +328,8 @@ jobs:
           cp ./community/data/netforge-antiad ./publish/netforge-antiad.txt
           cp ./community/data/netforge-adrules ./publish/netforge-adrules.txt
           cp ./community/data/netforge-neodev ./publish/netforge-neodev.txt
+          cp ./community/data/nf-direct-exception ./publish/nf-direct-exception.txt
+          cp ./community/data/nf-proxy-exception ./publish/nf-proxy-exception.txt
           cd ./publish || exit 1
           zip rules.zip {proxy,direct,reject}-list.txt geoip.dat geosite.dat
           sha256sum geosite.dat > geosite.dat.sha256sum
