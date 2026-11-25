@@ -1,0 +1,5 @@
+example.com
+sub.example.com
+xn--bcher-kva.example
+a-b.example.org
+localhost

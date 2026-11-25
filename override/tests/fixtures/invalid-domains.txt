@@ -1,0 +1,11 @@
+1.2.3.4
+example..com
+-bad.example.com
+bad-.example.com
+http://example.com
+example.com/path
+foo bar.com
+a.
+.example.com
+example.com.
+example.toolonglabelaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa.com

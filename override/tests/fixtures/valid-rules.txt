@@ -1,0 +1,4 @@
+full:example.com
+keyword:ads.example
+regexp:(^|\.)ads[0-9]+\.example\.com$
+plain.example.org
