@@ -23,13 +23,15 @@ All four extra tags are merged into `category-ads-all`, so a single `geosite:cat
 - geoip.dat (CDN): `https://cdn.jsdelivr.net/gh/NetForgeCN/v2ray-rules-dat@release/geoip.dat`
 - extra tag plaintext: `https://raw.githubusercontent.com/NetForgeCN/v2ray-rules-dat/release/netforge-ads.txt`
 
-Each asset has a matching `.sha256sum`. A downstream OpenWrt package can consume these URLs directly; [NetForgeCN/Loyalsoldier](https://github.com/NetForgeCN/Loyalsoldier) is the packaging layer that turns them into `v2ray-geoip` / `v2ray-geosite` packages.
+`geoip.dat`, `geosite.dat` and `netforge-ads.txt` each have a matching `.sha256sum`; the release body also records the SHA-256 of every build input. A downstream OpenWrt package can consume these URLs directly; [NetForgeCN/Loyalsoldier](https://github.com/NetForgeCN/Loyalsoldier) is the packaging layer that turns them into `v2ray-geoip` / `v2ray-geosite` packages.
 
 ## Update Policy
 
-The upstream project builds daily at 22:00 UTC (06:00 Beijing). This repository checks every 30 minutes and builds when the latest upstream release is at least **2 hours old** and has not been built yet. Each release body records `upstream: <tag>` for idempotency.
+The upstream project builds daily at 22:00 UTC (06:00 Beijing). This repository checks every 30 minutes and builds when the latest upstream release is at least **2 hours old** and has not been built yet. Each release body records `upstream: <tag>` for idempotency, plus the immutable commit refs and SHA-256 digests of every input used for that build. Concurrent runs are serialized, actions are pinned to commit SHAs, and the build fails closed if upstream metadata cannot be verified.
 
-Manual rebuild: Actions → **Build NetForgeCN rules dat files** → Run workflow.
+Manual rebuild: Actions → **Build NetForgeCN rules dat files** → Run workflow (`force_build` overrides the age/idempotency guards). The `nf-direct-exception` / `nf-proxy-exception` tags are built from the reviewed files in `override/`.
+
+Before release, all lists are syntax-validated, `geosite.dat` is built twice and compared, checksum files and `rules.zip` contents are verified, then the complete `publish/` set is swapped in atomically.
 
 ## Customization
 

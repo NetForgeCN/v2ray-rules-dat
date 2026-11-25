@@ -7,20 +7,25 @@ on:
         description: 'Force rebuild even if upstream tag unchanged'
         type: boolean
         default: false
-      build_exceptions:
-        description: 'Rebuild srs exception tags from remote rule-sets'
-        type: boolean
-        default: false
   schedule:
     # Every 30 min; the guard step decides whether upstream is >=2h old.
     - cron: '*/30 * * * *'
 
+# The build itself only needs read access; write access is granted to the job.
 permissions:
-  contents: write
+  contents: read
+
+# Never run two builds (and two release pushes) against the same branch.
+concurrency:
+  group: build-netforgecn-rules-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
     defaults:
       run:
         shell: bash
@@ -29,105 +34,144 @@ jobs:
       built: ${{ steps.vars.outputs.built }}
     steps:
       - name: Checkout this repo (main)
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
         with:
           ref: main
           path: selfrepo
           fetch-depth: 0
 
-      - name: Set variables and upstream guard
+      - name: Set variables, resolve immutable refs and upstream guard
         id: vars
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
         run: |
           set -euo pipefail
-          echo "RELEASE_NAME=Released on $(date -u +%Y%m%d%H%M)" >> $GITHUB_ENV
-          echo "TAG_NAME=$(date -u +%Y%m%d%H%M)" >> $GITHUB_ENV
-          echo "CHINA_DOMAINS_URL=https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/accelerated-domains.china.conf" >> $GITHUB_ENV
-          echo "GOOGLE_DOMAINS_URL=https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/google.china.conf" >> $GITHUB_ENV
-          echo "APPLE_DOMAINS_URL=https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/master/apple.china.conf" >> $GITHUB_ENV
-          echo "EASYLISTCHINA_EASYLIST_REJECT_URL=https://easylist-downloads.adblockplus.org/easylistchina+easylist.txt" >> $GITHUB_ENV
-          echo "PETERLOWE_REJECT_URL=https://pgl.yoyo.org/adservers/serverlist.php?hostformat=hosts&showintro=1&mimetype=plaintext" >> $GITHUB_ENV
-          echo "ADGUARD_DNS_REJECT_URL=https://adguardteam.github.io/AdGuardSDNSFilter/Filters/filter.txt" >> $GITHUB_ENV
-          echo "DANPOLLOCK_REJECT_URL=https://someonewhocares.org/hosts/hosts" >> $GITHUB_ENV
-          echo "CUSTOM_DIRECT=https://raw.githubusercontent.com/Loyalsoldier/domain-list-custom/release/cn.txt" >> $GITHUB_ENV
-          echo "CUSTOM_PROXY=https://raw.githubusercontent.com/Loyalsoldier/domain-list-custom/release/geolocation-!cn.txt" >> $GITHUB_ENV
-          echo "WIN_SPY=https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/master/data/hosts/spy.txt" >> $GITHUB_ENV
-          echo "WIN_UPDATE=https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/master/data/hosts/update.txt" >> $GITHUB_ENV
-          echo "WIN_EXTRA=https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/master/data/hosts/extra.txt" >> $GITHUB_ENV
+          umask 077
 
-          # Load custom ad source URLs from override config
-          source ./selfrepo/override/custom-sources.env
-          echo "ANTIAD_URL=$ANTIAD_URL" >> $GITHUB_ENV
-          echo "ADRULES_URL=$ADRULES_URL" >> $GITHUB_ENV
-          echo "NEODEV_URL=$NEODEV_URL" >> $GITHUB_ENV
+          echo "RELEASE_NAME=Released on $(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
+          echo "TAG_NAME=$(date -u +%Y%m%d%H%M)" >> "$GITHUB_ENV"
 
-          # Query upstream latest release time via GitHub API.
-          # NOTE: authenticated request is REQUIRED. Anonymous API calls from shared
-          # runner IPs hit the 60 req/h limit and return 403 (root cause of run #44486261146).
-          API_HDRS=(-fsSL --retry 5 --retry-all-errors --retry-delay 3
-                    -H "Accept: application/vnd.github+json"
-                    -H "Authorization: Bearer ${{ secrets.GITHUB_TOKEN }}"
-                    -H "X-GitHub-Api-Version: 2022-11-28")
-          UPSTREAM_JSON=$(curl "${API_HDRS[@]}" \
-            https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest) || UPSTREAM_JSON=""
+          # All HTTP calls are HTTPS-only, bounded and retried. The token is
+          # passed via a header (never embedded in a URL or logged).
+          api_get() {
+            curl --silent --show-error --fail \
+              --proto '=https' --proto-redir '=https' \
+              --location --max-redirs 5 \
+              --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 2 \
+              --max-filesize 10485760 \
+              -H 'Accept: application/vnd.github+json' \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H 'X-GitHub-Api-Version: 2022-11-28' \
+              "$1"
+          }
+
+          resolve_ref() {
+            REPO="$1" BRANCH="$2" python3 - <<'PY'
+          import json
+          import os
+          import urllib.request
+
+          repo, branch = os.environ["REPO"], os.environ["BRANCH"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": "Bearer " + os.environ["GH_TOKEN"],
+              "User-Agent": "netforgecn-rules-build",
+          }
+          def get(url):
+              request = urllib.request.Request(url, headers=headers)
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  return json.load(response)
+          print(get(f"https://api.github.com/repos/{repo}/commits/{branch}")["sha"])
+          PY
+          }
+
+          # Resolve mutable branches to immutable commit SHAs for this build.
+          # domain-list-custom keeps the Go builder on `master` but publishes
+          # its generated plaintext lists on `release`; both must be pinned.
+          CUSTOM_REF=$(resolve_ref Loyalsoldier/domain-list-custom master)
+          CUSTOM_DATA_REF=$(resolve_ref Loyalsoldier/domain-list-custom release)
+          COMMUNITY_REF=$(resolve_ref v2fly/domain-list-community master)
+          GFWLIST_REF=$(resolve_ref cokebar/gfwlist2dnsmasq master)
+          DNSMASQ_REF=$(resolve_ref felixonmars/dnsmasq-china-list master)
+          WINSPY_REF=$(resolve_ref crazy-max/WindowsSpyBlocker master)
+          GEOIP_REF=$(resolve_ref Loyalsoldier/geoip release)
+          for ref in "$CUSTOM_REF" "$CUSTOM_DATA_REF" "$COMMUNITY_REF" "$GFWLIST_REF" "$DNSMASQ_REF" "$WINSPY_REF" "$GEOIP_REF"; do
+            [[ "$ref" =~ ^[0-9a-f]{40}$ ]] || { echo "bad commit SHA: $ref" >&2; exit 1; }
+          done
+          echo "CUSTOM_REF=$CUSTOM_REF" >> "$GITHUB_ENV"
+          echo "CUSTOM_DATA_REF=$CUSTOM_DATA_REF" >> "$GITHUB_ENV"
+          echo "COMMUNITY_REF=$COMMUNITY_REF" >> "$GITHUB_ENV"
+          echo "GFWLIST_REF=$GFWLIST_REF" >> "$GITHUB_ENV"
+          SOURCE_REFS="domain-list-custom@master:$CUSTOM_REF domain-list-custom@release:$CUSTOM_DATA_REF domain-list-community@master:$COMMUNITY_REF gfwlist2dnsmasq@master:$GFWLIST_REF dnsmasq-china-list@master:$DNSMASQ_REF WindowsSpyBlocker@master:$WINSPY_REF geoip@release:$GEOIP_REF"
+          echo "SOURCE_REFS=$SOURCE_REFS" >> "$GITHUB_ENV"
+
+          UPSTREAM_JSON=$(api_get https://api.github.com/repos/Loyalsoldier/v2ray-rules-dat/releases/latest || true)
           if [ -z "$UPSTREAM_JSON" ]; then
-            # Fallback: use git ls-remote (no API rate limit) to at least get the tag.
+            # Fallback: git ls-remote (no API rate limit) to at least get a tag.
             echo "GitHub API failed; falling back to git ls-remote"
             UPSTREAM_TAG=$(git ls-remote --tags --refs https://github.com/Loyalsoldier/v2ray-rules-dat.git \
-              | awk -F/ '{print $NF}' | grep -E '^[0-9]{12}$' | sort | tail -1)
+              | awk -F/ '{print $NF}' | grep -E '^[0-9]{12}$' | sort -n | tail -1)
             UPSTREAM_PUBLISHED=""
           else
             UPSTREAM_TAG=$(printf '%s' "$UPSTREAM_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tag_name",""))')
             UPSTREAM_PUBLISHED=$(printf '%s' "$UPSTREAM_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("published_at",""))')
           fi
-          echo "upstream_tag=$UPSTREAM_TAG" >> $GITHUB_OUTPUT
-          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> $GITHUB_ENV
+          echo "upstream_tag=$UPSTREAM_TAG" >> "$GITHUB_OUTPUT"
+          echo "UPSTREAM_TAG=$UPSTREAM_TAG" >> "$GITHUB_ENV"
 
-          if [ -z "$UPSTREAM_TAG" ]; then
-            echo "upstream_tag is empty, abort"
-            echo "built=false" >> $GITHUB_OUTPUT
+          if ! [[ "$UPSTREAM_TAG" =~ ^[0-9]{12}$ ]]; then
+            echo "upstream_tag is missing or malformed, abort" >&2
+            echo "built=false" >> "$GITHUB_OUTPUT"
             exit 1
           fi
 
           # Manual dispatch skips the 2h wait (user explicitly asked to run now).
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             echo "Manual dispatch: skip 2h guard"
-            echo "built=true" >> $GITHUB_OUTPUT
+            echo "built=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          # If API failed (no published_at), skip age/idempotency guard and build.
           if [ -z "$UPSTREAM_PUBLISHED" ]; then
-            echo "No published_at (API fallback); skip age guard"
-            echo "built=true" >> $GITHUB_OUTPUT
-            exit 0
+            echo "No published_at (API fallback); fail closed instead of building unverified data" >&2
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            exit 1
           fi
 
-          # Convert published_at to epoch (GNU date), compute age in seconds.
-          UP_EPOCH=$(date -d "$UPSTREAM_PUBLISHED" +%s)
-          NOW_EPOCH=$(date -u +%s)
-          AGE=$(( NOW_EPOCH - UP_EPOCH ))
+          # Portable RFC3339 -> epoch conversion (GNU date's -d is not portable).
+          UP_EPOCH=$(python3 - "$UPSTREAM_PUBLISHED" <<'PY'
+          import sys
+          from datetime import datetime, timezone
+          value = sys.argv[1].replace("Z", "+00:00")
+          print(int(datetime.fromisoformat(value).astimezone(timezone.utc).timestamp()))
+          PY
+          )
+          AGE=$(( $(date -u +%s) - UP_EPOCH ))
           echo "upstream published=$UPSTREAM_PUBLISHED age=${AGE}s"
 
-          # Idempotency: find the upstream_tag recorded in this repo's latest release body.
           LAST_TAG=""
-          LAST_BODY=$(curl "${API_HDRS[@]}" \
-            https://api.github.com/repos/${{ github.repository }}/releases/latest \
-            | python3 -c 'import sys,json; d=json.load(sys.stdin); print(d.get("body",""))' 2>/dev/null || true)
+          LAST_BODY=$(api_get "https://api.github.com/repos/${{ github.repository }}/releases/latest" \
+            | python3 -c 'import sys,json; print(json.load(sys.stdin).get("body",""))' 2>/dev/null || true)
           if [ -n "$LAST_BODY" ]; then
             LAST_TAG=$(printf '%s' "$LAST_BODY" | sed -n 's/.*upstream: *\([^[:space:]]*\).*/\1/p' | head -1)
           fi
           echo "last built upstream tag: ${LAST_TAG:-none}"
 
-          if [ "$LAST_TAG" = "$UPSTREAM_TAG" ]; then
+          if [ "$LAST_TAG" = "$UPSTREAM_TAG" ] && [ "$FORCE_BUILD" != "true" ]; then
             echo "Already built for upstream $UPSTREAM_TAG, skip."
-            echo "built=false" >> $GITHUB_OUTPUT
+            echo "built=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          if [ "$AGE" -lt 7200 ]; then
+          if [ "$AGE" -lt 7200 ] && [ "$FORCE_BUILD" != "true" ]; then
             echo "Upstream updated less than 2 hours ago (${AGE}s), skip."
-            echo "built=false" >> $GITHUB_OUTPUT
+            echo "built=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          echo "built=true" >> $GITHUB_OUTPUT
+          echo "built=true" >> "$GITHUB_OUTPUT"
+
+      - name: Run repository checks
+        if: always() && steps.vars.outputs.built == 'true'
+        run: bash ./selfrepo/override/scripts/run-tests.sh
 
       - name: Stop if no build needed
         if: steps.vars.outputs.built != 'true'
@@ -135,98 +179,132 @@ jobs:
 
       - name: Checkout Loyalsoldier/domain-list-custom
         if: steps.vars.outputs.built == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
         with:
           repository: Loyalsoldier/domain-list-custom
+          ref: ${{ env.CUSTOM_REF }}
           path: custom
 
       - name: Checkout v2fly/domain-list-community
         if: steps.vars.outputs.built == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
         with:
           repository: v2fly/domain-list-community
+          ref: ${{ env.COMMUNITY_REF }}
           path: community
 
       - name: Checkout cokebar/gfwlist2dnsmasq
         if: steps.vars.outputs.built == 'true'
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
         with:
           repository: cokebar/gfwlist2dnsmasq
+          ref: ${{ env.GFWLIST_REF }}
           path: gfwlist2dnsmasq
 
       - name: Setup Go
         if: steps.vars.outputs.built == 'true'
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5.6.0 (pinned)
         with:
           go-version-file: ./custom/go.mod
           cache-dependency-path: ./custom/go.sum
 
-      - name: Get geoip.dat related files
+      - name: Download and verify all upstream inputs
         if: steps.vars.outputs.built == 'true'
+        env:
+          CHINA_DOMAINS_URL: https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/${{ env.DNSMASQ_REF }}/accelerated-domains.china.conf
+          GOOGLE_DOMAINS_URL: https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/${{ env.DNSMASQ_REF }}/google.china.conf
+          APPLE_DOMAINS_URL: https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/${{ env.DNSMASQ_REF }}/apple.china.conf
+          CUSTOM_DIRECT: https://raw.githubusercontent.com/Loyalsoldier/domain-list-custom/${{ env.CUSTOM_DATA_REF }}/cn.txt
+          CUSTOM_PROXY: https://raw.githubusercontent.com/Loyalsoldier/domain-list-custom/${{ env.CUSTOM_DATA_REF }}/geolocation-!cn.txt
+          WIN_SPY: https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/${{ env.WINSPY_REF }}/data/hosts/spy.txt
+          WIN_UPDATE: https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/${{ env.WINSPY_REF }}/data/hosts/update.txt
+          WIN_EXTRA: https://raw.githubusercontent.com/crazy-max/WindowsSpyBlocker/${{ env.WINSPY_REF }}/data/hosts/extra.txt
+          GEOIP_URL: https://raw.githubusercontent.com/Loyalsoldier/geoip/${{ env.GEOIP_REF }}/geoip.dat
+          GEOIP_SUM_URL: https://raw.githubusercontent.com/Loyalsoldier/geoip/${{ env.GEOIP_REF }}/geoip.dat.sha256sum
         run: |
-          wget -q https://github.com/Loyalsoldier/geoip/raw/release/geoip.dat
-          wget -q https://github.com/Loyalsoldier/geoip/raw/release/geoip.dat.sha256sum
+          set -euo pipefail
+          umask 077
+          bash ./selfrepo/override/scripts/fetch-sources.sh .
+          {
+            echo 'SOURCE_DIGESTS<<NF_DIGESTS_EOF'
+            cat sources/SHA256SUMS
+            echo 'NF_DIGESTS_EOF'
+          } >> "$GITHUB_ENV"
 
       - name: Generate GFWList domains
         if: steps.vars.outputs.built == 'true'
         run: |
-          cd gfwlist2dnsmasq || exit 1
+          set -euo pipefail
+          cd gfwlist2dnsmasq
           chmod +x ./gfwlist2dnsmasq.sh
+          # The pinned third-party converter fetches gfwlist over HTTPS itself;
+          # its output is syntax-checked below before it can be published.
           ./gfwlist2dnsmasq.sh -l -o ./temp-gfwlist.txt
+          [ -s ./temp-gfwlist.txt ]
 
       - name: Get and add direct domains
         if: steps.vars.outputs.built == 'true'
         run: |
-          curl -L --retry 3 --fail-with-body "$CHINA_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > temp-direct.txt
-          curl -L --retry 3 --fail-with-body "$CUSTOM_DIRECT" | perl -ne '/^(domain):([^:]+)(\n$|:@.+)/ && print "$2\n"' >> temp-direct.txt
+          set -euo pipefail
+          perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' sources/china.conf > temp-direct.txt
+          perl -ne '/^(domain):([^:]+)(\n$|:@.+)/ && print "$2\n"' sources/custom-cn.txt >> temp-direct.txt
+          [ -s temp-direct.txt ]
 
       - name: Get and add proxy domains
         if: steps.vars.outputs.built == 'true'
         run: |
-          cat ./gfwlist2dnsmasq/temp-gfwlist.txt | perl -ne '/^((?=^.{3,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})+)/ && print "$1\n"' > temp-proxy.txt
-          curl -L --retry 3 --fail-with-body "$GOOGLE_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' >> temp-proxy.txt
-          curl -L --retry 3 --fail-with-body "$APPLE_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' >> temp-proxy.txt
-          curl -L --retry 3 --fail-with-body "$CUSTOM_PROXY" | perl -ne 'next if /:\@cn/; /^(domain):([^:]+)(\n$|:@.+)/ && print "$2\n"' >> temp-proxy.txt
+          set -euo pipefail
+          perl -ne '/^((?=^.{3,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})+)/ && print "$1\n"' gfwlist2dnsmasq/temp-gfwlist.txt > temp-proxy.txt
+          perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' sources/google.conf >> temp-proxy.txt
+          perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' sources/apple.conf >> temp-proxy.txt
+          perl -ne 'next if /:\@cn/; /^(domain):([^:]+)(\n$|:@.+)/ && print "$2\n"' sources/custom-proxy.txt >> temp-proxy.txt
+          [ -s temp-proxy.txt ]
 
       - name: Get and add reject domains (upstream sources)
         if: steps.vars.outputs.built == 'true'
         run: |
-          curl -L --retry 3 --fail-with-body "$EASYLISTCHINA_EASYLIST_REJECT_URL" | perl -ne '/^\|\|([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})\^$/ && print "$1\n"' | perl -ne 'print if not /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/' > temp-reject.txt
-          curl -L --retry 3 --fail-with-body "$ADGUARD_DNS_REJECT_URL" | perl -ne '/^\|\|([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})\^$/ && print "$1\n"' | perl -ne 'print if not /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/' >> temp-reject.txt
-          curl -L --retry 3 --fail-with-body "$PETERLOWE_REJECT_URL" | perl -ne '/^127\.0\.0\.1\s([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})$/ && print "$1\n"' >> temp-reject.txt
-          curl -L --retry 3 --fail-with-body "$DANPOLLOCK_REJECT_URL" | perl -ne '/^127\.0\.0\.1\s([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})/ && print "$1\n"' | sed '1d' >> temp-reject.txt
+          set -euo pipefail
+          perl -ne '/^\|\|([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})\^$/ && print "$1\n"' sources/easylist.txt \
+            | perl -ne 'print if not /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/' > temp-reject.txt
+          perl -ne '/^\|\|([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})\^$/ && print "$1\n"' sources/adguard.txt \
+            | perl -ne 'print if not /^[0-9]{1,3}(\.[0-9]{1,3}){3}$/' >> temp-reject.txt
+          perl -ne '/^127\.0\.0\.1\s([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})$/ && print "$1\n"' sources/peterlowe.txt >> temp-reject.txt
+          perl -ne '/^127\.0\.0\.1\s([-_0-9a-zA-Z]+(\.[-_0-9a-zA-Z]+){1,64})/ && print "$1\n"' sources/danpollock.txt \
+            | sed '1d' >> temp-reject.txt
+          [ -s temp-reject.txt ]
 
       - name: Get and add NetForgeCN custom ad domains
         if: steps.vars.outputs.built == 'true'
         run: |
+          set -euo pipefail
           # anti-AD: plain domains, skip # metadata/comments
-          curl -L --retry 3 --fail-with-body "$ANTIAD_URL" \
-            | perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' >> temp-reject.txt
+          perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' sources/antiad.txt >> temp-reject.txt
           # Cats-Team AdRules mosdns: domain: prefix
-          curl -L --retry 3 --fail-with-body "$ADRULES_URL" \
-            | perl -ne 'next if /^\s*#/; /^domain:([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' >> temp-reject.txt
+          perl -ne 'next if /^\s*#/; /^domain:([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' sources/adrules.txt >> temp-reject.txt
           # neodevhost: plain domains, skip # metadata/comments
-          curl -L --retry 3 --fail-with-body "$NEODEV_URL" \
-            | perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' >> temp-reject.txt
-          # Save the three custom lists separately to build dedicated tags
-          curl -L --retry 3 --fail-with-body "$ANTIAD_URL" \
-            | perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' | sort --ignore-case -u > temp-netforge-antiad.txt
-          curl -L --retry 3 --fail-with-body "$ADRULES_URL" \
-            | perl -ne 'next if /^\s*#/; /^domain:([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' | sort --ignore-case -u > temp-netforge-adrules.txt
-          curl -L --retry 3 --fail-with-body "$NEODEV_URL" \
-            | perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' | sort --ignore-case -u > temp-netforge-neodev.txt
+          perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' sources/neodev.txt >> temp-reject.txt
+          # Dedicated tags built from the same cached, digest-verified inputs.
+          perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' sources/antiad.txt | sort --ignore-case -u > temp-netforge-antiad.txt
+          perl -ne 'next if /^\s*#/; /^domain:([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' sources/adrules.txt | sort --ignore-case -u > temp-netforge-adrules.txt
+          perl -ne 'next if /^\s*#/; /^([a-zA-Z0-9][-_a-zA-Z0-9]*(\.[a-zA-Z0-9][-_a-zA-Z0-9]*)+)$/ && print "$1\n"' sources/neodev.txt | sort --ignore-case -u > temp-netforge-neodev.txt
           cat temp-netforge-antiad.txt temp-netforge-adrules.txt temp-netforge-neodev.txt | sort --ignore-case -u > temp-netforge-ads.txt
+          for name in antiad adrules neodev ads; do
+            [ -s "temp-netforge-$name.txt" ] || { echo "empty netforge-$name list" >&2; exit 1; }
+          done
           wc -l temp-netforge-*.txt
 
       - name: Reserve special rules from custom lists
         if: steps.vars.outputs.built == 'true'
         run: |
-          curl -L --retry 3 --fail-with-body "$CUSTOM_DIRECT" | perl -ne '/^((full|regexp|keyword):[^:]+)(\n$|:@.+)/ && print "$1\n"' | sort --ignore-case -u > direct-reserve.txt
-          curl -L --retry 3 --fail-with-body "$CUSTOM_PROXY" | perl -ne 'next if /:\@cn/; /^((full|regexp|keyword):[^:]+)(\n$|:@.+)/ && print "$1\n"' | sort --ignore-case -u > proxy-reserve.txt
+          set -euo pipefail
+          perl -ne '/^((full|regexp|keyword):[^:]+)(\n$|:@.+)/ && print "$1\n"' sources/custom-cn.txt | sort --ignore-case -u > direct-reserve.txt
+          perl -ne 'next if /:\@cn/; /^((full|regexp|keyword):[^:]+)(\n$|:@.+)/ && print "$1\n"' sources/custom-proxy.txt | sort --ignore-case -u > proxy-reserve.txt
+          [ -s direct-reserve.txt ] && [ -s proxy-reserve.txt ]
 
       - name: Add override domains from this repo
         if: steps.vars.outputs.built == 'true'
         run: |
+          set -euo pipefail
           cat ./selfrepo/override/proxy.txt >> temp-proxy.txt
           cat ./selfrepo/override/direct.txt >> temp-direct.txt
           cat ./selfrepo/override/reject.txt >> temp-reject.txt
@@ -234,21 +312,19 @@ jobs:
       - name: Sort and generate redundant lists
         if: steps.vars.outputs.built == 'true'
         run: |
-          cat temp-proxy.txt | sort --ignore-case -u > proxy-list-with-redundant
-          cat temp-direct.txt | sort --ignore-case -u > direct-list-with-redundant
-          cat temp-reject.txt | sort --ignore-case -u > reject-list-with-redundant
+          set -euo pipefail
+          sort --ignore-case -u temp-proxy.txt > proxy-list-with-redundant
+          sort --ignore-case -u temp-direct.txt > direct-list-with-redundant
+          sort --ignore-case -u temp-reject.txt > reject-list-with-redundant
 
       - name: Remove redundant domains
         if: steps.vars.outputs.built == 'true'
         run: |
+          set -euo pipefail
           cp ./selfrepo/override/findRedundantDomain.py .
-          chmod +x findRedundantDomain.py
-          ./findRedundantDomain.py ./direct-list-with-redundant ./direct-list-deleted-unsort
-          ./findRedundantDomain.py ./proxy-list-with-redundant ./proxy-list-deleted-unsort
-          ./findRedundantDomain.py ./reject-list-with-redundant ./reject-list-deleted-unsort
-          [ ! -f "direct-list-deleted-unsort" ] && touch direct-list-deleted-unsort
-          [ ! -f "proxy-list-deleted-unsort" ] && touch proxy-list-deleted-unsort
-          [ ! -f "reject-list-deleted-unsort" ] && touch reject-list-deleted-unsort
+          python3 ./findRedundantDomain.py ./direct-list-with-redundant ./direct-list-deleted-unsort
+          python3 ./findRedundantDomain.py ./proxy-list-with-redundant ./proxy-list-deleted-unsort
+          python3 ./findRedundantDomain.py ./reject-list-with-redundant ./reject-list-deleted-unsort
           grep -Fvxif ./direct-list-deleted-unsort ./direct-list-with-redundant > ./direct-list-without-redundant || [ "$?" -eq 1 ]
           grep -Fvxif ./proxy-list-deleted-unsort ./proxy-list-with-redundant > ./proxy-list-without-redundant || [ "$?" -eq 1 ]
           grep -Fvxif ./reject-list-deleted-unsort ./reject-list-with-redundant > ./reject-list-without-redundant || [ "$?" -eq 1 ]
@@ -256,6 +332,7 @@ jobs:
       - name: Remove need-to-remove domains
         if: steps.vars.outputs.built == 'true'
         run: |
+          set -euo pipefail
           grep -Fvxif ./selfrepo/override/direct-need-to-remove.txt ./direct-list-without-redundant > temp-cn.txt || [ "$?" -eq 1 ]
           grep -Fvxif ./selfrepo/override/proxy-need-to-remove.txt ./proxy-list-without-redundant > temp-geolocation-\!cn.txt || [ "$?" -eq 1 ]
           grep -Fvxif ./selfrepo/override/reject-need-to-remove.txt ./reject-list-without-redundant > temp-category-ads-all.txt || [ "$?" -eq 1 ]
@@ -263,29 +340,30 @@ jobs:
       - name: Write core lists to data directory
         if: steps.vars.outputs.built == 'true'
         run: |
-          cat temp-cn.txt | sort --ignore-case -u | perl -ne '/^((?=^.{1,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})*)/ && print "$1\n"' > ./community/data/cn
-          cat temp-geolocation-\!cn.txt | sort --ignore-case -u | perl -ne '/^((?=^.{1,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})*)/ && print "$1\n"' > ./community/data/geolocation-\!cn
-          cat temp-category-ads-all.txt | sort --ignore-case -u | perl -ne '/^((?=^.{1,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})*)/ && print "$1\n"' > ./community/data/category-ads-all
+          set -euo pipefail
+          sort --ignore-case -u temp-cn.txt | perl -ne '/^((?=^.{1,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})*)/ && print "$1\n"' > ./community/data/cn
+          sort --ignore-case -u temp-geolocation-\!cn.txt | perl -ne '/^((?=^.{1,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})*)/ && print "$1\n"' > ./community/data/geolocation-\!cn
+          sort --ignore-case -u temp-category-ads-all.txt | perl -ne '/^((?=^.{1,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})*)/ && print "$1\n"' > ./community/data/category-ads-all
 
       - name: Write NetForgeCN custom tags to data directory
         if: steps.vars.outputs.built == 'true'
         run: |
-          cat temp-netforge-antiad.txt | sort --ignore-case -u > ./community/data/netforge-antiad
-          cat temp-netforge-adrules.txt | sort --ignore-case -u > ./community/data/netforge-adrules
-          cat temp-netforge-neodev.txt | sort --ignore-case -u > ./community/data/netforge-neodev
-          cat temp-netforge-ads.txt | sort --ignore-case -u > ./community/data/netforge-ads
-          # srs-derived exception tags (from nekolsd/sing-geosite rule-set).
-          # These are independent tags; they do NOT alter cn / geolocation-!cn.
+          set -euo pipefail
+          sort --ignore-case -u temp-netforge-antiad.txt > ./community/data/netforge-antiad
+          sort --ignore-case -u temp-netforge-adrules.txt > ./community/data/netforge-adrules
+          sort --ignore-case -u temp-netforge-neodev.txt > ./community/data/netforge-neodev
+          sort --ignore-case -u temp-netforge-ads.txt > ./community/data/netforge-ads
+          # Independent exception tags; they do NOT alter cn / geolocation-!cn.
           cp ./selfrepo/override/nf-direct-exception ./community/data/nf-direct-exception
           cp ./selfrepo/override/nf-proxy-exception ./community/data/nf-proxy-exception
-          echo "custom tags written:"
           wc -l ./community/data/netforge-* ./community/data/nf-*
 
       - name: Add special rules back
         if: steps.vars.outputs.built == 'true'
         run: |
-          [ -f "direct-reserve.txt" ] && cat direct-reserve.txt >> ./community/data/cn
-          [ -f "proxy-reserve.txt" ] && cat proxy-reserve.txt >> ./community/data/geolocation-\!cn
+          set -euo pipefail
+          if [ -f direct-reserve.txt ]; then cat direct-reserve.txt >> ./community/data/cn; fi
+          if [ -f proxy-reserve.txt ]; then cat proxy-reserve.txt >> ./community/data/geolocation-\!cn; fi
           cp ./community/data/cn direct-list.txt
           cp ./community/data/geolocation-\!cn proxy-list.txt
           cp ./community/data/category-ads-all reject-list.txt
@@ -294,56 +372,130 @@ jobs:
       - name: Create extra tags
         if: steps.vars.outputs.built == 'true'
         run: |
-          curl -L --retry 3 --fail-with-body "$CHINA_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > ./community/data/china-list
-          curl -L --retry 3 --fail-with-body "$CHINA_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' > china-list.txt
-          curl -L --retry 3 --fail-with-body "$GOOGLE_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "full:$1\n"' > ./community/data/google-cn
-          curl -L --retry 3 --fail-with-body "$GOOGLE_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "full:$1\n"' > google-cn.txt
-          curl -L --retry 3 --fail-with-body "$APPLE_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "full:$1\n"' > ./community/data/apple-cn
-          curl -L --retry 3 --fail-with-body "$APPLE_DOMAINS_URL" | perl -ne '/^server=\/([^\/]+)\// && print "full:$1\n"' > apple-cn.txt
-          cat ./gfwlist2dnsmasq/temp-gfwlist.txt | perl -ne '/^((?=^.{3,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})+)/ && print "$1\n"' >> ./community/data/gfw
-          cat ./community/data/gfw | sort --ignore-case -u > gfw.txt
-          cat ./community/data/greatfire | sort --ignore-case -u > greatfire.txt
-          curl -L --retry 3 --fail-with-body "$WIN_SPY" | grep "0.0.0.0" | awk '{print $2}' > ./community/data/win-spy
-          curl -L --retry 3 --fail-with-body "$WIN_SPY" | grep "0.0.0.0" | awk '{print $2}' > win-spy.txt
-          curl -L --retry 3 --fail-with-body "$WIN_UPDATE" | grep "0.0.0.0" | awk '{print $2}' > ./community/data/win-update
-          curl -L --retry 3 --fail-with-body "$WIN_UPDATE" | grep "0.0.0.0" | awk '{print $2}' > win-update.txt
-          curl -L --retry 3 --fail-with-body "$WIN_EXTRA" | grep "0.0.0.0" | awk '{print $2}' > ./community/data/win-extra
-          curl -L --retry 3 --fail-with-body "$WIN_EXTRA" | grep "0.0.0.0" | awk '{print $2}' > win-extra.txt
+          set -euo pipefail
+          perl -ne '/^server=\/([^\/]+)\// && print "$1\n"' sources/china.conf > ./community/data/china-list
+          cp ./community/data/china-list china-list.txt
+          perl -ne '/^server=\/([^\/]+)\// && print "full:$1\n"' sources/google.conf > ./community/data/google-cn
+          cp ./community/data/google-cn google-cn.txt
+          perl -ne '/^server=\/([^\/]+)\// && print "full:$1\n"' sources/apple.conf > ./community/data/apple-cn
+          cp ./community/data/apple-cn apple-cn.txt
+          perl -ne '/^((?=^.{3,255})[a-zA-Z0-9][-_a-zA-Z0-9]{0,62}(\.[a-zA-Z0-9][-_a-zA-Z0-9]{0,62})+)/ && print "$1\n"' gfwlist2dnsmasq/temp-gfwlist.txt >> ./community/data/gfw
+          sort --ignore-case -u ./community/data/gfw > gfw.txt
+          sort --ignore-case -u ./community/data/greatfire > greatfire.txt
+          grep '0.0.0.0' sources/win-spy.txt | awk '{print $2}' > ./community/data/win-spy
+          cp ./community/data/win-spy win-spy.txt
+          grep '0.0.0.0' sources/win-update.txt | awk '{print $2}' > ./community/data/win-update
+          cp ./community/data/win-update win-update.txt
+          grep '0.0.0.0' sources/win-extra.txt | awk '{print $2}' > ./community/data/win-extra
+          cp ./community/data/win-extra win-extra.txt
+          for name in china-list apple-cn google-cn gfw greatfire win-spy win-update win-extra; do
+            [ -s "$name.txt" ] || { echo "empty $name.txt" >&2; exit 1; }
+          done
+
+      - name: Normalize final lists deterministically
+        if: steps.vars.outputs.built == 'true'
+        run: |
+          set -euo pipefail
+          python3 ./selfrepo/override/scripts/normalize-lists.py ./community/data \
+            cn 'geolocation-!cn' category-ads-all \
+            netforge-ads netforge-antiad netforge-adrules netforge-neodev \
+            nf-direct-exception nf-proxy-exception \
+            china-list google-cn apple-cn gfw greatfire win-spy win-update win-extra
+          # Refresh the flat copies used by rules.zip and the release assets.
+          cp ./community/data/cn direct-list.txt
+          cp ./community/data/geolocation-\!cn proxy-list.txt
+          cp ./community/data/category-ads-all reject-list.txt
+          cp ./community/data/netforge-ads netforge-ads.txt
+          cp ./community/data/china-list china-list.txt
+          cp ./community/data/google-cn google-cn.txt
+          cp ./community/data/apple-cn apple-cn.txt
+          cp ./community/data/gfw gfw.txt
+          cp ./community/data/greatfire greatfire.txt
+          cp ./community/data/win-spy win-spy.txt
+          cp ./community/data/win-update win-update.txt
+          cp ./community/data/win-extra win-extra.txt
+
+      - name: Validate generated rule lists
+        if: steps.vars.outputs.built == 'true'
+        run: |
+          set -euo pipefail
+          V="./selfrepo/override/scripts/validate_list.py"
+          python3 "$V" --mode rule --min 1000 --max 5000000 --sorted ./community/data/cn ./community/data/geolocation-\!cn ./community/data/category-ads-all
+          python3 "$V" --mode rule --min 1000 --max 5000000 --sorted ./community/data/netforge-ads ./community/data/netforge-antiad ./community/data/netforge-adrules ./community/data/netforge-neodev
+          python3 "$V" --mode rule --min 100 --max 100000 --sorted ./selfrepo/override/nf-direct-exception
+          python3 "$V" --mode rule --min 10 --max 100000 --sorted ./selfrepo/override/nf-proxy-exception
+          for name in proxy-list direct-list reject-list china-list gfw; do
+            python3 "$V" --mode rule --min 1000 --max 5000000 "$name.txt"
+          done
+          for name in apple-cn google-cn greatfire win-spy win-update win-extra; do
+            python3 "$V" --mode rule --min 1 --max 100000 "$name.txt"
+          done
 
       - name: Build geosite.dat file
         if: steps.vars.outputs.built == 'true'
         run: |
-          cd custom || exit 1
+          set -euo pipefail
+          cd custom
           go run ./ --datapath=../community/data
 
-      - name: Move and zip files and generate sha256
+      - name: Reproducibility check (build geosite.dat twice)
         if: steps.vars.outputs.built == 'true'
         run: |
-          install -Dp ./geoip.dat ./publish/geoip.dat
-          install -Dp ./geoip.dat.sha256sum ./publish/geoip.dat.sha256sum
-          install -Dp ./custom/publish/geosite.dat ./publish/geosite.dat
-          install -p {proxy,direct,reject}-list.txt ./publish/
-          install -p {china-list,apple-cn,google-cn,gfw,greatfire,win-spy,win-update,win-extra}.txt ./publish/
-          install -p netforge-ads.txt netforge-antiad.txt netforge-adrules.txt netforge-neodev.txt ./publish/ 2>/dev/null || true
-          cp ./community/data/netforge-antiad ./publish/netforge-antiad.txt
-          cp ./community/data/netforge-adrules ./publish/netforge-adrules.txt
-          cp ./community/data/netforge-neodev ./publish/netforge-neodev.txt
-          cp ./community/data/nf-direct-exception ./publish/nf-direct-exception.txt
-          cp ./community/data/nf-proxy-exception ./publish/nf-proxy-exception.txt
-          cd ./publish || exit 1
-          zip rules.zip {proxy,direct,reject}-list.txt geoip.dat geosite.dat
-          sha256sum geosite.dat > geosite.dat.sha256sum
-          sha256sum netforge-ads.txt > netforge-ads.txt.sha256sum
+          set -euo pipefail
+          . ./selfrepo/override/scripts/lib.sh
+          mkdir -p reproducibility
+          cp custom/publish/geosite.dat reproducibility/geosite-first.dat
+          (cd custom && go run ./ --datapath=../community/data)
+          FIRST=$(nf_sha256 reproducibility/geosite-first.dat)
+          SECOND=$(nf_sha256 custom/publish/geosite.dat)
+          echo "geosite.dat sha256 first=$FIRST second=$SECOND"
+          [ "$FIRST" = "$SECOND" ] || { echo "non-reproducible geosite.dat" >&2; exit 1; }
+
+      - name: Guard against duplicate release
+        if: steps.vars.outputs.built == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FORCE_BUILD: ${{ github.event.inputs.force_build || 'false' }}
+        run: |
+          set -euo pipefail
+          if [ "$FORCE_BUILD" = "true" ]; then
+            echo "force_build=true; allowing overwrite of $TAG_NAME"
+            exit 0
+          fi
+          # No --fail here: a 404 is expected and must return its status code.
+          code=$(curl --silent --show-error \
+            --proto '=https' --proto-redir '=https' --location --max-redirs 5 \
+            --connect-timeout 15 --max-time 60 --retry 3 --retry-delay 2 \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'Accept: application/vnd.github+json' \
+            -o /dev/null -w '%{http_code}' \
+            "https://api.github.com/repos/${{ github.repository }}/releases/tags/${TAG_NAME}" || echo 000)
+          if [ "$code" = "200" ]; then
+            echo "release $TAG_NAME already exists; refusing duplicate publish" >&2
+            exit 1
+          fi
+          echo "release tag $TAG_NAME is free (HTTP $code)"
+
+      - name: Stage and validate publication artifacts
+        if: steps.vars.outputs.built == 'true'
+        run: |
+          set -euo pipefail
+          bash ./selfrepo/override/scripts/prepare-publish.sh .
+          ls -l publish
 
       - name: Release and upload assets
         if: steps.vars.outputs.built == 'true'
-        uses: svenstaro/upload-release-action@v2
+        uses: svenstaro/upload-release-action@29e53e917877a24fad85510ded594ab3c9ca12de # 2.11.5 (pinned)
         with:
           repo_token: ${{ secrets.GITHUB_TOKEN }}
           release_name: ${{ env.RELEASE_NAME }}
           tag: ${{ env.TAG_NAME }}
           body: |
             upstream: ${{ env.UPSTREAM_TAG }}
+            source refs: ${{ env.SOURCE_REFS }}
+
+            Input digests:
+            ${{ env.SOURCE_DIGESTS }}
 
             Self-maintained rules. Extra tags: netforge-antiad, netforge-adrules, netforge-neodev, netforge-ads (all merged into category-ads-all).
           file_glob: true
@@ -353,19 +505,31 @@ jobs:
       - name: Git push assets to "release" branch
         if: steps.vars.outputs.built == 'true'
         run: |
-          cd publish || exit 1
+          set -euo pipefail
+          cd publish
           git init -q
           git config --local user.name "github-actions[bot]"
           git config --local user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git checkout -b release
+          git checkout -q -b release
           git add .
-          git commit -m "${{ env.RELEASE_NAME }}" -q
-          git push -f -u "https://${{ github.actor }}:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}" release:release
+          git -c user.name="github-actions[bot]" -c user.email="41898282+github-actions[bot]@users.noreply.github.com" \
+            commit -q -m "${RELEASE_NAME}"
+          # Token is supplied as a header, not as part of the remote URL or logs.
+          AUTH=$(printf 'x-access-token:%s' "${{ secrets.GITHUB_TOKEN }}" | base64 | tr -d '\n')
+          git -c http.extraHeader="AUTHORIZATION: basic $AUTH" \
+            push -q -f "https://github.com/${{ github.repository }}" release:release
+          unset AUTH
 
       - name: Purge jsdelivr CDN
         if: steps.vars.outputs.built == 'true'
         run: |
-          cd publish || exit 1
-          for file in $(ls); do
-            curl -s -i "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/${file}" > /dev/null || true
+          set -uo pipefail
+          cd publish
+          for path in *; do
+            [ -f "$path" ] || continue
+            if ! curl --silent --show-error --proto '=https' --proto-redir '=https' \
+                --location --max-redirs 5 --connect-timeout 10 --max-time 30 --retry 2 --retry-delay 2 \
+                "https://purge.jsdelivr.net/gh/${{ github.repository }}@release/${path}" > /dev/null; then
+              echo "WARNING: failed to purge $path" >&2
+            fi
           done

@@ -1,0 +1,5 @@
+full:
+keyword:1.2.3.4
+regexp:foo bar
+unknown:example.com
+full:example..com
