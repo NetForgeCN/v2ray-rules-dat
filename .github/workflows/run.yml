@@ -34,7 +34,7 @@ jobs:
       built: ${{ steps.vars.outputs.built }}
     steps:
       - name: Checkout this repo (main)
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pinned)
         with:
           ref: main
           path: selfrepo
@@ -179,7 +179,7 @@ jobs:
 
       - name: Checkout Loyalsoldier/domain-list-custom
         if: steps.vars.outputs.built == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pinned)
         with:
           repository: Loyalsoldier/domain-list-custom
           ref: ${{ env.CUSTOM_REF }}
@@ -187,7 +187,7 @@ jobs:
 
       - name: Checkout v2fly/domain-list-community
         if: steps.vars.outputs.built == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pinned)
         with:
           repository: v2fly/domain-list-community
           ref: ${{ env.COMMUNITY_REF }}
@@ -195,7 +195,7 @@ jobs:
 
       - name: Checkout cokebar/gfwlist2dnsmasq
         if: steps.vars.outputs.built == 'true'
-        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0 (pinned)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pinned)
         with:
           repository: cokebar/gfwlist2dnsmasq
           ref: ${{ env.GFWLIST_REF }}
