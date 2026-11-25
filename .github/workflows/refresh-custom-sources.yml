@@ -1,0 +1,53 @@
+name: Refresh custom ad source pins
+
+# Resolve the three upstream default-branch heads every day, verify the asset
+# bodies and refresh the commit/SHA-256 pins only when every check succeeds.
+on:
+  schedule:
+    - cron: '0 17 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: refresh-custom-sources
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1 (pinned)
+        with:
+          ref: main
+          persist-credentials: false
+
+      # Fail closed: the script aborts before writing anything if the API,
+      # download or content validation fails for any of the three sources.
+      - name: Resolve and update pins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/refresh-custom-sources.py
+
+      - name: Commit and push refreshed pins
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- override/custom-sources.env; then
+            echo "Pins already current; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- override/custom-sources.env
+          git commit -m "chore: 自动刷新自定义广告源 commit 与 SHA256 pin"
+          # Token is sent as a header, never embedded in a remote URL or logs.
+          AUTH=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          git -c http.extraHeader="AUTHORIZATION: basic $AUTH" push origin HEAD:main
+          unset AUTH
