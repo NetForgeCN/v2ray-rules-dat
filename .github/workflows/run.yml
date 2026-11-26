@@ -103,6 +103,9 @@ jobs:
           echo "CUSTOM_DATA_REF=$CUSTOM_DATA_REF" >> "$GITHUB_ENV"
           echo "COMMUNITY_REF=$COMMUNITY_REF" >> "$GITHUB_ENV"
           echo "GFWLIST_REF=$GFWLIST_REF" >> "$GITHUB_ENV"
+          echo "DNSMASQ_REF=$DNSMASQ_REF" >> "$GITHUB_ENV"
+          echo "WINSPY_REF=$WINSPY_REF" >> "$GITHUB_ENV"
+          echo "GEOIP_REF=$GEOIP_REF" >> "$GITHUB_ENV"
           SOURCE_REFS="domain-list-custom@master:$CUSTOM_REF domain-list-custom@release:$CUSTOM_DATA_REF domain-list-community@master:$COMMUNITY_REF gfwlist2dnsmasq@master:$GFWLIST_REF dnsmasq-china-list@master:$DNSMASQ_REF WindowsSpyBlocker@master:$WINSPY_REF geoip@release:$GEOIP_REF"
           echo "SOURCE_REFS=$SOURCE_REFS" >> "$GITHUB_ENV"
 
@@ -211,6 +214,13 @@ jobs:
       - name: Download and verify all upstream inputs
         if: steps.vars.outputs.built == 'true'
         env:
+          CUSTOM_REF: ${{ env.CUSTOM_REF }}
+          CUSTOM_DATA_REF: ${{ env.CUSTOM_DATA_REF }}
+          COMMUNITY_REF: ${{ env.COMMUNITY_REF }}
+          GFWLIST_REF: ${{ env.GFWLIST_REF }}
+          DNSMASQ_REF: ${{ env.DNSMASQ_REF }}
+          WINSPY_REF: ${{ env.WINSPY_REF }}
+          GEOIP_REF: ${{ env.GEOIP_REF }}
           CHINA_DOMAINS_URL: https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/${{ env.DNSMASQ_REF }}/accelerated-domains.china.conf
           GOOGLE_DOMAINS_URL: https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/${{ env.DNSMASQ_REF }}/google.china.conf
           APPLE_DOMAINS_URL: https://raw.githubusercontent.com/felixonmars/dnsmasq-china-list/${{ env.DNSMASQ_REF }}/apple.china.conf
@@ -224,6 +234,10 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
+          for name in CUSTOM_REF CUSTOM_DATA_REF COMMUNITY_REF GFWLIST_REF DNSMASQ_REF WINSPY_REF GEOIP_REF; do
+            value=${!name}
+            [[ "$value" =~ ^[0-9a-f]{40}$ ]] || { echo "missing or invalid $name for download URLs" >&2; exit 1; }
+          done
           bash ./selfrepo/override/scripts/fetch-sources.sh .
           {
             echo 'SOURCE_DIGESTS<<NF_DIGESTS_EOF'
