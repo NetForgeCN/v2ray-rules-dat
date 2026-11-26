@@ -31,7 +31,7 @@ The upstream project builds daily at 22:00 UTC (06:00 Beijing). This repository 
 
 Manual rebuild: Actions → **Build NetForgeCN rules dat files** → Run workflow (`force_build` overrides the age/idempotency guards). The `nf-direct-exception` / `nf-proxy-exception` tags are built from the reviewed files in `override/`.
 
-Before release, all lists are syntax-validated, `geosite.dat` is built twice and compared, checksum files and `rules.zip` contents are verified, then the complete `publish/` set is swapped in atomically.
+Before release, all lists are syntax-validated, `geosite.dat` is built twice, canonicalized to a stable protobuf entry/domain order and compared, checksum files and `rules.zip` contents are verified, then the complete `publish/` set is swapped in atomically.
 
 ## Customization
 

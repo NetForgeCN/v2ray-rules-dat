@@ -451,8 +451,11 @@ jobs:
           set -euo pipefail
           cd custom
           go run ./ --datapath=../community/data
+          # The pinned builder emits entries/domains in Go map iteration order.
+          # Canonicalize in place so the published dat is byte-reproducible.
+          go run ../selfrepo/override/scripts/canonicalize-geosite.go ./publish/geosite.dat
 
-      - name: Reproducibility check (build geosite.dat twice)
+      - name: Reproducibility check (build and canonicalize geosite.dat twice)
         if: steps.vars.outputs.built == 'true'
         run: |
           set -euo pipefail
@@ -460,6 +463,7 @@ jobs:
           mkdir -p reproducibility
           cp custom/publish/geosite.dat reproducibility/geosite-first.dat
           (cd custom && go run ./ --datapath=../community/data)
+          (cd custom && go run ../selfrepo/override/scripts/canonicalize-geosite.go ./publish/geosite.dat)
           FIRST=$(nf_sha256 reproducibility/geosite-first.dat)
           SECOND=$(nf_sha256 custom/publish/geosite.dat)
           echo "geosite.dat sha256 first=$FIRST second=$SECOND"
